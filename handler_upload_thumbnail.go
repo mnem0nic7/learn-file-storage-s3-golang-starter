@@ -13,6 +13,35 @@ import (
 	"github.com/google/uuid"
 )
 
+func getFileExtensionFromContentType(contentType string) string {
+	// Clean up the content type (remove charset and other params)
+	contentType = strings.Split(contentType, ";")[0]
+	contentType = strings.TrimSpace(contentType)
+
+	// Get extensions from MIME type
+	exts, err := mime.ExtensionsByType(contentType)
+	if err != nil || len(exts) == 0 {
+		// Fallback for common types
+		switch contentType {
+		case "image/jpeg":
+			return ".jpg"
+		case "image/png":
+			return ".png"
+		case "image/gif":
+			return ".gif"
+		case "image/webp":
+			return ".webp"
+		case "application/pdf":
+			return ".pdf"
+		default:
+			return ".bin" // fallback extension
+		}
+	}
+
+	// Return the first (most common) extension
+	return exts[0]
+}
+
 func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Request) {
 	videoIDString := r.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDString)
@@ -33,6 +62,8 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	fmt.Println("uploading thumbnail for video", videoID, "by user", userID)
+
 	const maxMemory = 10 << 20
 	if err := r.ParseMultipartForm(maxMemory); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Couldn't parse multipart form", err)
@@ -48,8 +79,18 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 
 	mediaTypeHeader := header.Header.Get("Content-Type")
 	if mediaTypeHeader == "" {
-		respondWithError(w, http.StatusBadRequest, "Content-Type header missing", nil)
-		return
+		buffer := make([]byte, 512)
+		if _, err := file.Read(buffer); err != nil {
+			respondWithError(w, http.StatusBadRequest, "Failed to read file for type detection", err)
+			return
+		}
+
+		mediaTypeHeader = http.DetectContentType(buffer)
+
+		if _, err := file.Seek(0, 0); err != nil {
+			respondWithError(w, http.StatusInternalServerError, "Failed to reset file pointer", err)
+			return
+		}
 	}
 
 	mediaType, _, err := mime.ParseMediaType(mediaTypeHeader)
@@ -75,6 +116,9 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	var fileExt string
 	if exts, err := mime.ExtensionsByType(mediaType); err == nil && len(exts) > 0 {
 		fileExt = exts[0]
+	}
+	if fileExt == "" {
+		fileExt = getFileExtensionFromContentType(mediaType)
 	}
 	if fileExt == "" {
 		fileExt = strings.ToLower(filepath.Ext(header.Filename))

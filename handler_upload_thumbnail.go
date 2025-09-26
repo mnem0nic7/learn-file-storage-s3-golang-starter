@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"mime"
@@ -12,35 +15,6 @@ import (
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
-
-func getFileExtensionFromContentType(contentType string) string {
-	// Clean up the content type (remove charset and other params)
-	contentType = strings.Split(contentType, ";")[0]
-	contentType = strings.TrimSpace(contentType)
-
-	// Get extensions from MIME type
-	exts, err := mime.ExtensionsByType(contentType)
-	if err != nil || len(exts) == 0 {
-		// Fallback for common types
-		switch contentType {
-		case "image/jpeg":
-			return ".jpg"
-		case "image/png":
-			return ".png"
-		case "image/gif":
-			return ".gif"
-		case "image/webp":
-			return ".webp"
-		case "application/pdf":
-			return ".pdf"
-		default:
-			return ".bin" // fallback extension
-		}
-	}
-
-	// Return the first (most common) extension
-	return exts[0]
-}
 
 func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Request) {
 	videoIDString := r.PathValue("videoID")
@@ -77,26 +51,11 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 	defer file.Close()
 
-	mediaTypeHeader := header.Header.Get("Content-Type")
-	if mediaTypeHeader == "" {
-		buffer := make([]byte, 512)
-		if _, err := file.Read(buffer); err != nil {
-			respondWithError(w, http.StatusBadRequest, "Failed to read file for type detection", err)
-			return
+	mediaType := header.Header.Get("Content-Type")
+	if mediaType != "" {
+		if parsed, _, err := mime.ParseMediaType(mediaType); err == nil {
+			mediaType = parsed
 		}
-
-		mediaTypeHeader = http.DetectContentType(buffer)
-
-		if _, err := file.Seek(0, 0); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "Failed to reset file pointer", err)
-			return
-		}
-	}
-
-	mediaType, _, err := mime.ParseMediaType(mediaTypeHeader)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Couldn't parse Content-Type", err)
-		return
 	}
 
 	video, err := cfg.db.GetVideo(videoID)
@@ -113,48 +72,74 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var fileExt string
-	if exts, err := mime.ExtensionsByType(mediaType); err == nil && len(exts) > 0 {
-		fileExt = exts[0]
+	const sniffLen = 512
+	sniffBuf := make([]byte, sniffLen)
+	n, err := io.ReadFull(file, sniffBuf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't read thumbnail file", err)
+		return
 	}
-	if fileExt == "" {
-		fileExt = getFileExtensionFromContentType(mediaType)
-	}
-	if fileExt == "" {
-		fileExt = strings.ToLower(filepath.Ext(header.Filename))
-	}
-	if fileExt == "" {
-		respondWithError(w, http.StatusBadRequest, "Couldn't determine file extension", nil)
+	sniffBytes := sniffBuf[:n]
+
+	if len(sniffBytes) == 0 {
+		respondWithError(w, http.StatusBadRequest, "Empty thumbnail file", nil)
 		return
 	}
 
-	filename := fmt.Sprintf("%s%s", videoID.String(), fileExt)
-	assetPath := filepath.Join(cfg.assetsRoot, filename)
+	if mediaType == "" || mediaType == "application/octet-stream" {
+		detectedType := http.DetectContentType(sniffBytes)
+		if detectedType != "" {
+			mediaType = detectedType
+		}
+	}
 
-	dst, err := os.Create(assetPath)
+	if mediaType == "" {
+		respondWithError(w, http.StatusBadRequest, "Couldn't determine media type", nil)
+		return
+	}
+
+	exts, _ := mime.ExtensionsByType(mediaType)
+	ext := ""
+	if len(exts) > 0 {
+		ext = exts[0]
+	}
+	if ext == "" {
+		if idx := strings.Index(mediaType, "/"); idx != -1 && idx < len(mediaType)-1 {
+			ext = "." + mediaType[idx+1:]
+		}
+	}
+	if ext == "" {
+		respondWithError(w, http.StatusBadRequest, "Couldn't determine file extension", nil)
+		return
+	}
+	ext = strings.ToLower(ext)
+
+	randomBytes := make([]byte, 32)
+	if _, err := rand.Read(randomBytes); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't generate thumbnail name", err)
+		return
+	}
+	randomName := base64.RawURLEncoding.EncodeToString(randomBytes)
+	destName := randomName + ext
+	destPath := filepath.Join(cfg.assetsRoot, destName)
+
+	destFile, err := os.Create(destPath)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't create thumbnail file", err)
 		return
 	}
+	defer destFile.Close()
 
-	if _, err := io.Copy(dst, file); err != nil {
-		dst.Close()
-		os.Remove(assetPath)
-		respondWithError(w, http.StatusInternalServerError, "Couldn't write thumbnail file", err)
+	_, err = io.Copy(destFile, io.MultiReader(bytes.NewReader(sniffBytes), file))
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't save thumbnail file", err)
 		return
 	}
 
-	if err := dst.Close(); err != nil {
-		os.Remove(assetPath)
-		respondWithError(w, http.StatusInternalServerError, "Couldn't close thumbnail file", err)
-		return
-	}
-
-	thumbnailURL := fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, filename)
-	video.ThumbnailURL = &thumbnailURL
+	url := fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, destName)
+	video.ThumbnailURL = &url
 
 	if err := cfg.db.UpdateVideo(video); err != nil {
-		os.Remove(assetPath)
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video", err)
 		return
 	}
